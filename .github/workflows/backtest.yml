@@ -57,13 +57,11 @@ jobs:
             --tp "${{ inputs.tp }}" \
             --sl "${{ inputs.sl }}" \
             --hold-max "${{ inputs.hold_max }}" \
-            --priority "${{ inputs.priority }}"
-            --outdir .
+            --priority "${{ inputs.priority }}" \
+            --outdir backtest_out
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results
-          path: |
-            trades.csv
-            summary.csv
+          path: bavktest_out/*.csv
