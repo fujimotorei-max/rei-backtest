@@ -50,6 +50,7 @@ jobs:
       - name: Run backtest
         run: |
           python backtest_sma_oco.py \
+            --watch watchlist_module.py \
             --start "${{ inputs.start }}" \
             --end "${{ inputs.end }}" \
             --limit "${{ inputs.limit }}" \
