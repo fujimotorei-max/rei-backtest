@@ -1,22 +1,52 @@
-# backtest_sma_oco.py
-# SMA(5/25/75) alignment entry + OCO(TP/SL) backtest with max concurrent positions
-# Entry when SMA5 > SMA25 > SMA75 (no "newly" requirement)
-# Enter next day's open, exit by OCO using daily OHLC (with gap handling)
-
-import argparse
 import os
-from dataclasses import dataclass, asdict
-from datetime import datetime
+import json
+import argparse
+import datetime as dt
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import yfinance as yf
-
-# ---- watchlist ----
-# watchlist_module.py must define: watchlist = {"1301.T": "極洋", ...}
-from watchlist_module import watchlist
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
+# -----------------------------
+# Watchlist loader
+# -----------------------------
+def load_watchlist(path: str) -> Dict[str, str]:
+    """
+    Accept:
+      - .py file exporting `watchlist` dict (e.g., {"1301.T": "極洋", ...})
+      - .json file containing a dict
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"--watch '{path}' が見つからないよ。大文字小文字も含めて、リポジトリのファイル名と完全一致させてね。"
+        )
+
+    if path.endswith(".json"):
+        with open(path, "r", encoding="utf-8") as f:
+            wl = json.load(f)
+        if not isinstance(wl, dict):
+            raise ValueError("watchlist json は dict 形式じゃないとだめ。")
+        return wl
+
+    if path.endswith(".py"):
+        ns = {}
+        with open(path, "r", encoding="utf-8") as f:
+            code = f.read()
+        exec(compile(code, path, "exec"), ns, ns)
+        wl = ns.get("watchlist")
+        if not isinstance(wl, dict):
+            raise ValueError(f"{path} に watchlist (dict) が見つからないよ。")
+        return wl
+
+    raise ValueError("--watch は .py か .json を指定してね。")
+
+
+# -----------------------------
+# Strategy
+# -----------------------------
 @dataclass
 class Trade:
     code: str
@@ -25,31 +55,9 @@ class Trade:
     entry_price: float
     exit_date: str
     exit_price: float
-    exit_reason: str  # TP / SL / TIME
-    tp: float
-    sl: float
+    exit_reason: str  # TP / SL / TIME / EOD
     hold_days: int
-    ret_pct: float
-    open_positions_at_entry: int
-
-
-def safe_mkdir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-
-def download_ohlc(code: str, start: str, end: str) -> pd.DataFrame:
-    """
-    Download daily OHLC from yfinance.
-    yfinance end is inclusive-ish depending; we pass end and accept what comes.
-    """
-    df = yf.download(code, start=start, end=end, interval="1d", auto_adjust=False, progress=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    # Normalize columns in case MultiIndex
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-    df = df[["Open", "High", "Low", "Close"]].dropna()
-    return df
+    ret: float
 
 
 def add_sma(df: pd.DataFrame, windows=(5, 25, 75)) -> pd.DataFrame:
@@ -59,329 +67,238 @@ def add_sma(df: pd.DataFrame, windows=(5, 25, 75)) -> pd.DataFrame:
     return out
 
 
-def choose_exit_price_on_gap(open_price: float, tp: float, sl: float, reason: str) -> float:
-    """
-    If open gaps beyond tp/sl, we assume fill at open.
-    """
-    if reason == "TP" and open_price >= tp:
-        return open_price
-    if reason == "SL" and open_price <= sl:
-        return open_price
-    return None  # means "not a gap fill"
+def entry_signal_align_only(row: pd.Series) -> bool:
+    """5 > 25 > 75 ならエントリー（新規判定いらない）"""
+    return (row["SMA5"] > row["SMA25"]) and (row["SMA25"] > row["SMA75"])
 
 
-def simulate_one_trade(
-    code: str,
-    name: str,
+def simulate_oco_exit(
     df: pd.DataFrame,
-    entry_idx: int,
-    tp_mult: float,
-    sl_mult: float,
-    hold_max: int,
-    priority: str,
-    open_positions_at_entry: int,
-) -> Optional[Trade]:
-    """
-    Entry at next day's Open after entry_idx (signal day).
-    Then monitor from that day onward up to hold_max days.
-    Exit by OCO using daily OHLC.
-    """
-    if entry_idx + 1 >= len(df):
-        return None  # no next day to enter
-
-    entry_day = df.index[entry_idx + 1]
-    entry_open = float(df["Open"].iloc[entry_idx + 1])
-
-    tp = entry_open * tp_mult
-    sl = entry_open * sl_mult
-
-    exit_reason = "TIME"
-    exit_price = float(df["Close"].iloc[min(entry_idx + hold_max, len(df) - 1)])
-    exit_day = df.index[min(entry_idx + hold_max, len(df) - 1)]
-    hold_days = 0
-
-    # We start checking from entry day itself (entry at open -> same day's high/low can hit)
-    start_i = entry_idx + 1
-    end_i = min(entry_idx + hold_max, len(df) - 1)
-
-    for i in range(start_i, end_i + 1):
-        day = df.index[i]
-        o = float(df["Open"].iloc[i])
-        h = float(df["High"].iloc[i])
-        l = float(df["Low"].iloc[i])
-        c = float(df["Close"].iloc[i])
-
-        # Gap handling: if open already beyond levels
-        if o >= tp:
-            exit_reason = "TP"
-            exit_price = o
-            exit_day = day
-            hold_days = i - start_i
-            break
-        if o <= sl:
-            exit_reason = "SL"
-            exit_price = o
-            exit_day = day
-            hold_days = i - start_i
-            break
-
-        hit_tp = h >= tp
-        hit_sl = l <= sl
-
-        if hit_tp and hit_sl:
-            # both touched same day -> choose by priority
-            if priority == "TP_first":
-                exit_reason = "TP"
-                exit_price = tp
-            elif priority == "SL_first":
-                exit_reason = "SL"
-                exit_price = sl
-            else:  # GapFair: decide by which is closer to open (crude but fair-ish)
-                if abs(tp - o) < abs(o - sl):
-                    exit_reason = "TP"
-                    exit_price = tp
-                else:
-                    exit_reason = "SL"
-                    exit_price = sl
-            exit_day = day
-            hold_days = i - start_i
-            break
-
-        if hit_tp:
-            exit_reason = "TP"
-            exit_price = tp
-            exit_day = day
-            hold_days = i - start_i
-            break
-
-        if hit_sl:
-            exit_reason = "SL"
-            exit_price = sl
-            exit_day = day
-            hold_days = i - start_i
-            break
-
-        # else continue until TIME exit
-
-    ret_pct = (exit_price / entry_open) - 1.0
-
-    return Trade(
-        code=code,
-        name=name,
-        entry_date=str(entry_day.date()),
-        entry_price=entry_open,
-        exit_date=str(exit_day.date()),
-        exit_price=exit_price,
-        exit_reason=exit_reason,
-        tp=tp,
-        sl=sl,
-        hold_days=hold_days,
-        ret_pct=ret_pct,
-        open_positions_at_entry=open_positions_at_entry,
-    )
-
-
-def build_summary(trades: pd.DataFrame, max_positions: int) -> pd.DataFrame:
-    """
-    Simple portfolio accounting:
-    - Initial equity = 1.0
-    - Each trade uses position_size = 1/max_positions
-    - Cash sits idle if fewer than max_positions open.
-    - Equity updates on exit dates (no mark-to-market).
-    """
-    if trades.empty:
-        return pd.DataFrame([{
-            "trades": 0,
-            "win_rate": 0.0,
-            "avg_ret_pct": 0.0,
-            "profit_factor": 0.0,
-            "total_ret_pct": 0.0,
-            "max_drawdown_pct": 0.0,
-        }])
-
-    t = trades.copy()
-    t["entry_date"] = pd.to_datetime(t["entry_date"])
-    t["exit_date"] = pd.to_datetime(t["exit_date"])
-    t = t.sort_values(["exit_date", "entry_date"]).reset_index(drop=True)
-
-    pos_size = 1.0 / max_positions
-    t["pnl"] = pos_size * t["ret_pct"]
-
-    equity = 1.0
-    equity_curve = []
-    peak = 1.0
-    max_dd = 0.0
-
-    for _, row in t.iterrows():
-        equity *= (1.0 + float(row["pnl"]))
-        peak = max(peak, equity)
-        dd = (equity / peak) - 1.0
-        max_dd = min(max_dd, dd)
-        equity_curve.append((row["exit_date"], equity))
-
-    wins = t[t["ret_pct"] > 0.0]
-    losses = t[t["ret_pct"] < 0.0]
-
-    gross_profit = (pos_size * wins["ret_pct"]).sum()
-    gross_loss = -(pos_size * losses["ret_pct"]).sum()
-
-    pf = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
-
-    summary = {
-        "trades": int(len(t)),
-        "win_rate": float((t["ret_pct"] > 0).mean()),
-        "avg_ret_pct": float(t["ret_pct"].mean()),
-        "profit_factor": float(pf) if pf != float("inf") else 9999.0,
-        "total_ret_pct": float(equity - 1.0),
-        "max_drawdown_pct": float(max_dd),
-    }
-    return pd.DataFrame([summary])
-
-
-def backtest(
-    watch: str,
-    start: str,
-    end: str,
+    entry_i: int,
     tp: float,
     sl: float,
     hold_max: int,
     priority: str,
-    limit: int,
-    outdir: str,
-    max_positions: int,
-):
-    safe_mkdir(outdir)
+) -> Tuple[int, float, str]:
+    """
+    Entry at next day's Open (to avoid look-ahead).
+    Then simulate OCO using daily High/Low.
+    priority:
+      - SL_first: if both hit same day -> SL
+      - TP_first: -> TP
+      - GapFair : if Open gaps beyond level, use Open price; if both beyond, choose closer (rough)
+    Returns: (exit_index, exit_price, reason)
+    """
+    # entry happens at entry_i (already next day)
+    entry_price = float(df.iloc[entry_i]["Open"])
+    tp_price = entry_price * (1.0 + tp)
+    sl_price = entry_price * (1.0 - sl)
 
-    if watch == "all":
-        items = list(watchlist.items())
-    else:
-        # comma separated codes
-        codes = [c.strip() for c in watch.split(",") if c.strip()]
-        items = [(c, watchlist.get(c, c)) for c in codes]
+    last_i = min(entry_i + hold_max - 1, len(df) - 1)
 
-    if limit and limit > 0:
-        items = items[:limit]
+    for i in range(entry_i, last_i + 1):
+        o = float(df.iloc[i]["Open"])
+        h = float(df.iloc[i]["High"])
+        l = float(df.iloc[i]["Low"])
+
+        # Gap handling
+        if priority == "GapFair":
+            # If open already beyond TP/SL, assume executed at open.
+            if o >= tp_price and o <= sl_price:
+                # practically impossible unless tp_price <= sl_price, but keep safe
+                return i, o, "EOD"
+            if o >= tp_price:
+                return i, o, "TP"
+            if o <= sl_price:
+                return i, o, "SL"
+
+        hit_tp = h >= tp_price
+        hit_sl = l <= sl_price
+
+        if hit_tp and hit_sl:
+            if priority == "TP_first":
+                return i, tp_price, "TP"
+            if priority == "SL_first":
+                return i, sl_price, "SL"
+            # GapFair: decide by which is closer to Open (rough intraday order proxy)
+            if abs(o - tp_price) < abs(o - sl_price):
+                return i, tp_price, "TP"
+            else:
+                return i, sl_price, "SL"
+        elif hit_tp:
+            return i, tp_price, "TP"
+        elif hit_sl:
+            return i, sl_price, "SL"
+
+    # time exit at last day close
+    return last_i, float(df.iloc[last_i]["Close"]), "TIME"
+
+
+def backtest_one(
+    code: str,
+    name: str,
+    start: str,
+    end: Optional[str],
+    tp: float,
+    sl: float,
+    hold_max: int,
+    priority: str,
+) -> List[Trade]:
+    raw = yf.download(code, start=start, end=end, interval="1d", progress=False, auto_adjust=False)
+    if raw is None or raw.empty:
+        return []
+
+    df = raw.copy()
+    df = add_sma(df)
+    df = df.dropna().reset_index()
+
+    if df.empty or len(df) < 2:
+        return []
 
     trades: List[Trade] = []
+    in_pos = False
+    i = 0
 
-    # Track open positions by their exit_date (we know after sim, but for concurrency we need forward sim)
-    # We'll do day-by-day scan per code and enforce max_positions by keeping a global "open until date" list.
+    while i < len(df) - 1:
+        row = df.iloc[i]
+        if not in_pos:
+            if entry_signal_align_only(row):
+                # Enter next day open
+                entry_i = i + 1
+                exit_i, exit_price, reason = simulate_oco_exit(
+                    df=df,
+                    entry_i=entry_i,
+                    tp=tp,
+                    sl=sl,
+                    hold_max=hold_max,
+                    priority=priority,
+                )
+                entry_price = float(df.iloc[entry_i]["Open"])
+                entry_date = str(df.iloc[entry_i]["Date"].date())
+                exit_date = str(df.iloc[exit_i]["Date"].date())
+                hold_days = int(exit_i - entry_i + 1)
+                ret = (exit_price / entry_price) - 1.0
 
-    # Global list of (exit_date, code) for currently open positions at the moment of entering a new one.
-    open_positions: List[Tuple[pd.Timestamp, str]] = []
+                trades.append(
+                    Trade(
+                        code=code,
+                        name=name,
+                        entry_date=entry_date,
+                        entry_price=entry_price,
+                        exit_date=exit_date,
+                        exit_price=exit_price,
+                        exit_reason=reason,
+                        hold_days=hold_days,
+                        ret=ret,
+                    )
+                )
+                # after exit, continue scanning from exit day
+                i = exit_i
+            else:
+                i += 1
+        else:
+            i += 1
 
-    for idx, (code, name) in enumerate(items, 1):
-        print(f"[{idx}/{len(items)}] {code} {name}")
+    return trades
 
-        df = download_ohlc(code, start, end)
-        if df.empty or len(df) < 80:
-            print("  -> skip (no/short data)")
-            continue
 
-        df = add_sma(df)
-        df = df.dropna().copy()
-        if df.empty or len(df) < 2:
-            print("  -> skip (no SMA data)")
-            continue
+def trades_to_df(trades: List[Trade]) -> pd.DataFrame:
+    if not trades:
+        return pd.DataFrame(
+            columns=[
+                "code","name","entry_date","entry_price","exit_date","exit_price",
+                "exit_reason","hold_days","ret"
+            ]
+        )
+    return pd.DataFrame([t.__dict__ for t in trades])
 
-        # Signal on day i (close known) => enter at day i+1 open.
-        for i in range(len(df) - 1):
-            curr = df.iloc[i]
-            align = (curr["SMA5"] > curr["SMA25"] > curr["SMA75"])
-            if not bool(align):
-                continue
 
-            signal_day = df.index[i]
-            entry_day = df.index[i + 1]
+def summary_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame([{
+            "trades": 0,
+            "win_rate": 0.0,
+            "avg_ret": 0.0,
+            "median_ret": 0.0,
+            "total_ret_simple_sum": 0.0,
+            "avg_hold_days": 0.0,
+            "tp_count": 0,
+            "sl_count": 0,
+            "time_count": 0,
+        }])
 
-            # Before entering, drop positions already closed by entry_day
-            open_positions = [(ed, c) for (ed, c) in open_positions if ed >= entry_day]
-
-            if len(open_positions) >= max_positions:
-                # can't enter due to concurrency cap
-                continue
-
-            trade = simulate_one_trade(
-                code=code,
-                name=name,
-                df=df,
-                entry_idx=i,
-                tp_mult=tp,
-                sl_mult=sl,
-                hold_max=hold_max,
-                priority=priority,
-                open_positions_at_entry=len(open_positions),
-            )
-            if trade is None:
-                continue
-
-            # Register this position as open until its exit date (inclusive)
-            exit_day_ts = pd.to_datetime(trade.exit_date)
-            open_positions.append((exit_day_ts, code))
-
-            trades.append(trade)
-
-    trades_df = pd.DataFrame([asdict(t) for t in trades])
-
-    if trades_df.empty:
-        print("No trades produced.")
-        # still output empty files for convenience
-        trades_path = os.path.join(outdir, "trades.csv")
-        summary_path = os.path.join(outdir, "summary.csv")
-        trades_df.to_csv(trades_path, index=False, encoding="utf-8-sig")
-        build_summary(trades_df, max_positions=max_positions).to_csv(summary_path, index=False, encoding="utf-8-sig")
-        print(f"Saved: {trades_path}, {summary_path}")
-        return
-
-    # Add nice fields
-    trades_df["ret_pct"] = trades_df["ret_pct"].astype(float)
-    trades_df = trades_df.sort_values(["entry_date", "code"]).reset_index(drop=True)
-
-    trades_path = os.path.join(outdir, "trades.csv")
-    summary_path = os.path.join(outdir, "summary.csv")
-
-    trades_df.to_csv(trades_path, index=False, encoding="utf-8-sig")
-    summary_df = build_summary(trades_df, max_positions=max_positions)
-    summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
-
-    print(f"Saved: {trades_path}, {summary_path}")
+    win_rate = float((df["ret"] > 0).mean())
+    return pd.DataFrame([{
+        "trades": int(len(df)),
+        "win_rate": win_rate,
+        "avg_ret": float(df["ret"].mean()),
+        "median_ret": float(df["ret"].median()),
+        "total_ret_simple_sum": float(df["ret"].sum()),
+        "avg_hold_days": float(df["hold_days"].mean()),
+        "tp_count": int((df["exit_reason"] == "TP").sum()),
+        "sl_count": int((df["exit_reason"] == "SL").sum()),
+        "time_count": int((df["exit_reason"] == "TIME").sum()),
+    }])
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--watch", required=True,
-                   help="all もしくは '1301.T,1332.T' みたいにカンマ区切り")
-    p.add_argument("--start", required=True, help="YYYY-MM-DD")
-    p.add_argument("--end", default=None, help="YYYY-MM-DD (省略可)")
-    p.add_argument("--tp", type=float, default=1.06, help="TP倍率（例: 1.06 = +6%）")
-    p.add_argument("--sl", type=float, default=0.97, help="SL倍率（例: 0.97 = -3%）")
-    p.add_argument("--hold-max", type=int, default=60, help="最大保有日数")
-    p.add_argument("--priority", choices=["TP_first", "SL_first", "GapFair"], default="GapFair",
-                   help="同日にTP/SL両方触れた場合の優先")
-    p.add_argument("--limit", type=int, default=0, help="テスト銘柄数の上限（0なら無制限）")
-    p.add_argument("--outdir", default="backtest_out", help="出力フォルダ")
-    p.add_argument("--max-positions", type=int, default=3, help="同時保有の最大銘柄数")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--watch", required=True, help="watchlist_module.py など（.py or .json）")
+    ap.add_argument("--start", default="2015-01-01")
+    ap.add_argument("--end", default=None)
+    ap.add_argument("--tp", type=float, default=0.06)
+    ap.add_argument("--sl", type=float, default=0.03)
+    ap.add_argument("--hold-max", type=int, default=40)
+    ap.add_argument("--priority", choices=["SL_first", "TP_first", "GapFair"], default="GapFair")
+    ap.add_argument("--limit", type=int, default=200)
+    ap.add_argument("--outdir", default="backtest_out")
+    ap.add_argument("--max-workers", type=int, default=3)  # ←同時3銘柄まで
+    args = ap.parse_args()
 
-    args = p.parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
 
-    end = args.end
-    if end is None:
-        # yfinance end is exclusive-ish; but ok. We'll set end to today+1
-        end = (datetime.utcnow().date()).isoformat()
+    wl = load_watchlist(args.watch)
+    items = list(wl.items())[: args.limit]
 
-    backtest(
-        watch=args.watch,
-        start=args.start,
-        end=end,
-        tp=args.tp,
-        sl=args.sl,
-        hold_max=args.hold_max,
-        priority=args.priority,
-        limit=args.limit,
-        outdir=args.outdir,
-        max_positions=args.max_positions,
-    )
+    all_trades: List[Trade] = []
 
+    with ThreadPoolExecutor(max_workers=args.max_workers) as ex:
+        futures = [
+            ex.submit(
+                backtest_one,
+                code, name,
+                args.start, args.end,
+                args.tp, args.sl,
+                args.hold_max,
+                args.priority,
+            )
+            for code, name in items
+        ]
+        for fu in as_completed(futures):
+            try:
+                all_trades.extend(fu.result())
+            except Exception as e:
+                # 銘柄ごとの失敗は握りつぶして続行
+                print("[WARN] worker error:", e)
+
+    df_trades = trades_to_df(all_trades)
+    df_sum = summary_df(df_trades)
+
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    trades_path = os.path.join(args.outdir, f"trades_{stamp}.csv")
+    summary_path = os.path.join(args.outdir, f"summary_{stamp}.csv")
+
+    # 取引ゼロでも「空CSV」は保存する（Artifactsで確認できるように）
+    df_trades.to_csv(trades_path, index=False, encoding="utf-8-sig")
+    df_sum.to_csv(summary_path, index=False, encoding="utf-8-sig")
+
+    print(f"Saved: {trades_path}")
+    print(f"Saved: {summary_path}")
+    print(f"Trades: {len(df_trades)}")
+
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
