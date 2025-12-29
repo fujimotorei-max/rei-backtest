@@ -56,7 +56,7 @@ jobs:
             --limit "${{ inputs.limit }}" \
             --tp "${{ inputs.tp }}" \
             --sl "${{ inputs.sl }}" \
-            --hold_max "${{ inputs.hold_max }}" \
+            --hold-max "${{ inputs.hold_max }}" \
             --priority "${{ inputs.priority }}"
 
       - name: Upload artifacts
