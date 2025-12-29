@@ -9,6 +9,28 @@ import pandas as pd
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+def normalize_ohlc(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    """
+    yfinance が MultiIndex で返す/同名列が複数になるケースを吸収して、
+    Open/High/Low/Close を1列ずつに正規化する
+    """
+    if df is None or df.empty:
+        return df
+
+    # MultiIndex columns 対応
+    if isinstance(df.columns, pd.MultiIndex):
+        try:
+            df = df.xs(code, axis=1, level=1, drop_level=True)
+        except Exception:
+            df.columns = [c[0] for c in df.columns]
+
+    # Closeなどが DataFrame になってたら先頭列を使う
+    for col in ["Open", "High", "Low", "Close"]:
+        if col in df.columns and isinstance(df[col], pd.DataFrame):
+            df[col] = df[col].iloc[:, 0]
+
+    return df
+
 
 # -----------------------------
 # Watchlist loader
