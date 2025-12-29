@@ -3,41 +3,44 @@ name: Backtest SMA & OCO
 on:
   workflow_dispatch:
     inputs:
+      watch:
+        description: "watchlist file (例: watchlist_module.py)"
+        required: true
+        default: "watchlist_module.py"
       start:
-        description: "Start date (YYYY-MM-DD)"
+        description: "start YYYY-MM-DD"
         required: true
-        default: "2018-01-01"
+        default: "2023-01-01"
       end:
-        description: "End date (YYYY-MM-DD)"
+        description: "end YYYY-MM-DD"
         required: true
-        default: "2025-12-01"
+        default: "2025-12-31"
       limit:
-        description: "Max tickers (test run)"
-        required: true
-        default: "50"
+        description: "max tickers to test"
+        required: false
+        default: "300"
       tp:
-        description: "Take profit (e.g. 1.06)"
-        required: true
-        default: "1.06"
+        description: "take profit (例 0.06 = +6%)"
+        required: false
+        default: "0.06"
       sl:
-        description: "Stop loss (e.g. 0.97)"
-        required: true
-        default: "0.97"
+        description: "stop loss (例 0.03 = -3%)"
+        required: false
+        default: "0.03"
       hold_max:
-        description: "Max holding days"
-        required: true
+        description: "max holding days"
+        required: false
         default: "60"
       priority:
         description: "TP_first / SL_first / GapFair"
-        required: true
-        default: "SL_first"
+        required: false
+        default: "GapFair"
 
 jobs:
-  run:
+  backtest:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -50,7 +53,7 @@ jobs:
       - name: Run backtest
         run: |
           python backtest_sma_oco.py \
-            --watch watchlist_module.py \
+            --watch "${{ inputs.watch }}" \
             --start "${{ inputs.start }}" \
             --end "${{ inputs.end }}" \
             --limit "${{ inputs.limit }}" \
