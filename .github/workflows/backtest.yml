@@ -64,4 +64,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results
-          path: bavktest_out/*.csv
+          path: backtest_out/*.csv
