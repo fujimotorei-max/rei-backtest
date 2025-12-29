@@ -58,6 +58,7 @@ jobs:
             --sl "${{ inputs.sl }}" \
             --hold-max "${{ inputs.hold_max }}" \
             --priority "${{ inputs.priority }}"
+            --outdir .
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
