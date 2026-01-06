@@ -56,11 +56,9 @@ jobs:
             --watch "${{ inputs.watch }}" \
             --start "${{ inputs.start }}" \
             --end "${{ inputs.end }}" \
-            --limit "${{ inputs.limit }}" \
             --tp "${{ inputs.tp }}" \
             --sl "${{ inputs.sl }}" \
             --hold-max "${{ inputs.hold_max }}" \
-            --priority "${{ inputs.priority }}" \
             --outdir backtest_out
 
       - name: Upload artifacts
